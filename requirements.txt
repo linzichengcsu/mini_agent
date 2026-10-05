@@ -1,0 +1,6 @@
+# mini_agent 运行依赖
+# 安装: pip install -r requirements.txt
+# 测试使用标准库 unittest（python -m unittest discover），无需额外依赖
+
+openai>=1.30.0
+python-dotenv>=1.0.0
