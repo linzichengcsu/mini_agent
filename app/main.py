@@ -73,6 +73,99 @@ def assistant_message_to_dict(message) -> dict:
     }
 
 
+def run_turn(
+    messages,
+    tools=None,
+    max_rounds=None,
+    on_tool_call=None,
+    collect_tool_calls=False,
+) -> dict:
+    """执行一个"用户回合"的「模型 ⇄ 工具」循环，直到模型给出最终回复。
+
+    - messages: 会话消息列表；会被**原地追加**（assistant 工具调用请求、
+      tool 结果、最终 assistant 回复），调用方负责管理其生命周期。
+    - tools: 工具声明列表；为 None 时使用全局 registry.schemas()。
+    - max_rounds: 本回合最多发起几轮工具调用，默认 settings.MAX_TOOL_ROUNDS。
+    - on_tool_call: 可选回调 (name, arguments, result)，用于 CLI 打印日志。
+    - collect_tool_calls: 为 True 时，返回值里包含本轮全部工具调用记录。
+
+    返回值：
+      {
+        "reply": 最终文本回复,
+        "prompt_tokens": 输入 token,
+        "completion_tokens": 输出 token,
+        "total_tokens": 本轮总 token,
+        "cost": 本轮费用（元）,
+        "tool_calls": 工具调用记录列表（仅 collect_tool_calls=True 时非 None）,
+      }
+
+    该函数是 CLI 主循环与 API 服务的公共内核：命令行与 Java/HTTP 调用
+    走完全相同的工具调用协议，只是「回复展示」与「消息存储」方式不同。
+    """
+    if tools is None:
+        tools = registry.schemas()
+    if max_rounds is None:
+        max_rounds = settings.MAX_TOOL_ROUNDS
+
+    turn_prompt_tokens = 0
+    turn_completion_tokens = 0
+    turn_total_tokens = 0
+    turn_cost = 0.0
+    tool_calls = [] if collect_tool_calls else None
+    final_reply = ""
+
+    for _ in range(max_rounds):
+        message, usage = chat_once(messages, tools=tools)
+
+        turn_prompt_tokens += usage.prompt_tokens
+        turn_completion_tokens += usage.completion_tokens
+        turn_total_tokens += usage.total_tokens
+        turn_cost += calculate_cost(usage.prompt_tokens, usage.completion_tokens)
+
+        if message.tool_calls:
+            # 把模型的工具调用请求追加进对话
+            messages.append(assistant_message_to_dict(message))
+            for tool_call in message.tool_calls:
+                name = tool_call.function.name
+                arguments = tool_call.function.arguments
+                result = registry.execute(name, arguments)
+                if on_tool_call:
+                    on_tool_call(name, arguments, result)
+                if tool_calls is not None:
+                    tool_calls.append({"name": name, "arguments": arguments, "result": result})
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result,
+                })
+            continue
+
+        # 模型给出最终文本回复
+        final_reply = message.content or ""
+        messages.append({"role": "assistant", "content": final_reply})
+        break
+    else:
+        # 达到 max_rounds 仍未给出最终回复，兜底结束本回合
+        final_reply = "⚠️ 工具调用轮次达到上限，已中止本次回答。"
+        messages.append({"role": "assistant", "content": final_reply})
+
+    return {
+        "reply": final_reply,
+        "prompt_tokens": turn_prompt_tokens,
+        "completion_tokens": turn_completion_tokens,
+        "total_tokens": turn_total_tokens,
+        "cost": turn_cost,
+        "tool_calls": tool_calls,
+    }
+
+
+def _print_tool_call(name: str, arguments: str, result: str) -> None:
+    """CLI 模式下展示一次工具调用（供 run_agent 作为 on_tool_call 传入）。"""
+    print(f"🔧 调用工具: {name}({arguments})")
+    preview = result if len(result) <= 200 else result[:200] + "…"
+    print(f"   ↳ {preview}")
+
+
 def run_agent():
     """命令行主循环。"""
     print("🤖 代码审查助手已启动（支持工具调用：read_file / run_shell / search_code / ask_user）\n")
@@ -104,44 +197,13 @@ def run_agent():
         messages, _ = maybe_compress(messages)
 
         # ---- 工具调用循环：模型可能连续多次请求调用工具 ----
-        turn_prompt_tokens = 0
-        turn_completion_tokens = 0
-        turn_cost = 0.0
-        final_reply = ""
-
-        for _ in range(settings.MAX_TOOL_ROUNDS):
-            message, usage = chat_once(messages, tools=registry.schemas())
-
-            turn_prompt_tokens += usage.prompt_tokens
-            turn_completion_tokens += usage.completion_tokens
-            total_session_tokens += usage.total_tokens
-            turn_cost += calculate_cost(usage.prompt_tokens, usage.completion_tokens)
-
-            if message.tool_calls:
-                # 把模型的工具调用请求追加进对话
-                messages.append(assistant_message_to_dict(message))
-                for tool_call in message.tool_calls:
-                    name = tool_call.function.name
-                    arguments = tool_call.function.arguments
-                    print(f"🔧 调用工具: {name}({arguments})")
-                    result = registry.execute(name, arguments)
-                    preview = result if len(result) <= 200 else result[:200] + "…"
-                    print(f"   ↳ {preview}")
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": result,
-                    })
-                continue
-
-            # 模型给出最终文本回复
-            final_reply = message.content or ""
-            messages.append({"role": "assistant", "content": final_reply})
-            break
-        else:
-            # 达到 MAX_TOOL_ROUNDS 仍未给出最终回复，兜底结束本回合
-            final_reply = "⚠️ 工具调用轮次达到上限，已中止本次回答。"
-            messages.append({"role": "assistant", "content": final_reply})
+        stats = run_turn(messages, on_tool_call=_print_tool_call)
+        final_reply = stats["reply"]
+        turn_prompt_tokens = stats["prompt_tokens"]
+        turn_completion_tokens = stats["completion_tokens"]
+        turn_cost = stats["cost"]
+        total_session_tokens += stats["total_tokens"]
+        total_session_cost += turn_cost
 
         print(f"\n🤖 助手: {final_reply}")
         print(f"📊 本轮: 输入 {turn_prompt_tokens} | 输出 {turn_completion_tokens} | 合计 {turn_prompt_tokens + turn_completion_tokens} token")

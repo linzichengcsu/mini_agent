@@ -34,6 +34,7 @@ python run_tests.py      # 任意环境
 ```
 mini_agent/
 ├── main.py                    # 入口（转发到 app.main）
+├── serve.py                   # ★ API 服务入口（--mode http | stdio），供外部程序（如 Java）调用
 ├── app/
 │   ├── main.py                # Agent 主循环：对话 + 工具调用循环（组合根）
 │   ├── core/
@@ -41,10 +42,17 @@ mini_agent/
 │   ├── services/
 │   │   ├── context.py         # 上下文窗口限制 + 摘要压缩（按轮分组，保护工具调用对）
 │   │   └── token_utils.py     # token 估算（本地，无需网络）
+│   ├── server/                # ★ API 服务层（AgentService 内核 + 两种传输协议）
+│   │   ├── service.py         #   AgentService：会话管理 / 对话 / 直接执行工具
+│   │   ├── http_api.py        #   HTTP JSON API（标准库实现，零依赖）
+│   │   └── stdio_rpc.py       #   stdin/stdout JSON-RPC 子进程协议
 │   └── tools/                 # ★ 工具层（新增工具主要改这里）
 │       ├── base.py            # Tool 基类 + ToolRegistry + 路径安全检查
 │       ├── builtin.py         # 四个内置工具实现
 │       └── __init__.py        # 创建全局 registry 并注册内置工具
+├── java/                      # ★ Java 客户端（零第三方依赖，JDK 11+）
+│   ├── src/com/miniagent/client/   # Json / MiniAgentClient(HTTP) / AgentProcessClient(stdio) / Demo
+│   └── README.md                    # Java 端使用说明
 └── tests/                     # unittest 测试（全程 mock，不发真实请求）
 ```
 
@@ -169,6 +177,114 @@ registry.register(WebSearchTool())   # 新增
 
 - **更新系统提示词**：在 `app/core/config.py` 的 `SYSTEM_PROMPT` 里补充新工具的使用规则，能显著提升模型调用的正确率。
 - **独立成文件**：如果工具逻辑较长，可新建 `app/tools/web_search.py`，再在 `__init__.py` 里 import 注册，方式完全一样。
+
+## 把智能体变成可被 Java 调用的服务
+
+智能体除命令行交互外，还可作为**服务**被外部程序（重点：Java）调用。
+提供两种传输协议，共享同一套接口：
+
+| 方式 | 启动 | Java 调用 | 适用场景 |
+| --- | --- | --- | --- |
+| **HTTP JSON API** | `python serve.py`（默认 127.0.0.1:8000） | `java.net.http.HttpClient`（`MiniAgentClient`） | 远程 / 多客户端并发 |
+| **stdio JSON-RPC** | Java 自动启动 `python serve.py --mode stdio` | `ProcessBuilder` 子进程（`AgentProcessClient`） | 程序内嵌，无需端口 |
+
+两种方式都不需要安装任何新 Python 依赖（HTTP 服务用标准库 `http.server` 实现）。
+Java 客户端零第三方依赖（仅 JDK 11+），编译即用。
+
+### 1. HTTP JSON API（推荐）
+
+```bash
+python serve.py                      # 127.0.0.1:8000
+python serve.py --port 9000          # 自定义端口
+python serve.py --host 0.0.0.0       # 监听所有网卡（注意安全，见下）
+```
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/health` | 健康检查：`{status, model, tools, sessions}` |
+| `GET` | `/v1/tools` | 服务端可用工具声明（OpenAI JSON Schema 列表） |
+| `POST` | `/v1/chat` | 对话。body：`{"message": "…", "session_id"?: "…", "max_rounds"?: n}` |
+| `POST` | `/v1/tools/<name>/execute` | **直接执行工具**（绕过模型），body 即参数字典 |
+| `POST` | `/v1/sessions/<id>/reset` | 重置指定会话 |
+
+`/v1/chat` 响应示例：
+
+```json
+{
+  "session_id": "9f2c…",
+  "reply": "最终回复",
+  "prompt_tokens": 1200,
+  "completion_tokens": 300,
+  "total_tokens": 1500,
+  "cost": 0.0048,
+  "tool_calls": [
+    {"name": "read_file", "arguments": "{\"path\": \"main.py\"}", "result": "【文件…】…"}
+  ]
+}
+```
+
+要点：
+- **多轮对话**：第一次调用拿到 `session_id`，后续请求带上它即可延续上下文（服务端内存保存，超过 `--max-sessions` 个会话时淘汰最旧）。
+- **直接执行工具**：Java 可以不走模型、直接调用 `read_file` / `run_shell` / `search_code`，例如
+  `POST /v1/tools/read_file/execute`，body `{"path": "main.py"}`。
+- **`ask_user` 被移除**：服务端没有"坐在终端前的用户"，`ask_user` 不会出现在
+  `/v1/tools` 中，模型在 API 场景下也不会尝试提问，而是基于已有信息自行决策。
+
+### 2. stdio JSON-RPC（子进程协议）
+
+Java 用 `ProcessBuilder` 启动 `python serve.py --mode stdio`，通过标准输入输出
+按行交换 JSON，行为类似"本地调用"：
+
+```text
+请求（Java → Python stdin）：{"id": 1, "method": "chat", "params": {"message": "你好"}}
+响应（Python → Java stdout）：{"id": 1, "result": {"session_id": "…", "reply": "…", ...}}
+```
+
+方法：`health` / `list_tools` / `execute_tool` / `chat` / `reset_session`，
+参数与 HTTP 端点一一对应。错误返回 `{"id": …, "error": {"code": …, "message": …}}`。
+
+### 3. Java 客户端（开箱即用）
+
+```bash
+# 编译（项目根目录）
+javac -encoding UTF-8 -d java/out java/src/com/miniagent/client/*.java
+
+# 运行演示（stdio 方式自包含；HTTP 方式需先 python serve.py）
+java -Dfile.encoding=UTF-8 -cp java/out com.miniagent.client.Demo ".\.venv\Scripts\python.exe"
+```
+
+```java
+// 方式一：stdio 子进程（无需先启动服务）
+try (AgentProcessClient c = new AgentProcessClient(".venv/Scripts/python.exe", ".", 120_000)) {
+    c.chat("请审查 main.py");                       // 新会话
+    c.chat("继续", c.chat("再看一眼").sessionId);    // 多轮对话
+    c.executeTool("read_file", Map.of("path", "main.py"));
+}
+
+// 方式二：HTTP（需先 python serve.py）
+try (MiniAgentClient c = new MiniAgentClient("http://127.0.0.1:8000")) {
+    MiniAgentClient.ChatResult r = c.chat("请审查 main.py");
+    c.executeTool("search_code", Map.of("pattern", "TODO"));
+}
+```
+
+完整方法说明、返回字段与进阶用法见 [java/README.md](java/README.md)。
+
+### 4. 关于"native 函数"（JNI / JPype 等）的说明
+
+Java 直连 Python 的"真 native"方案（JNI 嵌入 CPython、[JPype](https://jpype.readthedocs.io/)、
+JEP、GraalPy）需要在两端维护复杂的桥接代码与构建配置，且跨平台脆弱。对绝大多数
+业务场景，**HTTP 或 stdio 子进程协议是更稳、更易维护的"其他方式"**：它们把
+"调用智能体"变成一次网络请求/一次进程通信，Java 侧封装成普通方法即可，
+Python 侧零侵入（见上）。若确有同进程强耦合需求，可基于本项目把 `app.server.service.AgentService`
+包进 JPype/JEP，无需改动内核。
+
+### 5. 安全注意事项（API 模式）
+
+- **默认只绑定 127.0.0.1**。`run_shell` 可执行任意命令，**不要**在无认证的公网
+  环境暴露此服务；确需远程访问请先加反向代理 + 鉴权。
+- 服务端移除 `ask_user`，`execute_tool` 对 `ask_user` 也返回拒绝。
+- 会话保存在内存中，`--max-sessions` 控制上限；重启服务即清空。
 
 ## 相关配置项
 
