@@ -33,6 +33,25 @@ def summarize_conversation(messages) -> str:
     return response.choices[0].message.content.strip()
 
 
+def group_by_turns(messages):
+    """把消息按「用户回合」分组。
+
+    每个用户回合 = 1 条 user 消息 + 其后直到下一条 user 之前的全部消息
+    （含多轮 assistant tool_calls / tool 结果 / 最终 assistant 回复）。
+    按轮切分可保证工具调用对（assistant tool_calls 与其 tool 结果）永远不会被拆开，
+    避免给模型发送「孤儿 tool 消息」导致 API 报错。
+    """
+    groups = []
+    for m in messages:
+        if m["role"] == "user":
+            groups.append([m])
+        elif groups:
+            groups[-1].append(m)
+        else:
+            groups.append([m])  # 开头的 system 等
+    return groups
+
+
 def maybe_compress(messages, verbose=True):
     """上下文窗口限制 + 摘要压缩的核心逻辑。
 
@@ -46,9 +65,15 @@ def maybe_compress(messages, verbose=True):
         return messages, before
 
     # 拆分：系统提示 + 可压缩区(older) + 最近保留区(recent)
+    # 按“轮”切分，保证工具调用对不被拆散；无工具时每轮 = 1 问 + 1 答，语义与原来一致
     head, tail = messages[0], messages[1:]
-    keep_count = min(settings.KEEP_RECENT_TURNS * 2, len(tail))
-    older, recent = tail[:-keep_count], tail[-keep_count:]
+    groups = group_by_turns(tail)
+    keep_groups = min(settings.KEEP_RECENT_TURNS, len(groups))
+    if keep_groups:
+        older = [m for g in groups[:-keep_groups] for m in g]
+        recent = [m for g in groups[-keep_groups:] for m in g]
+    else:
+        older, recent = [], []
 
     if older:
         if count_messages_tokens(older) >= settings.MIN_SUMMARIZE_TOKENS:
@@ -69,8 +94,9 @@ def maybe_compress(messages, verbose=True):
         candidates = [(i, m) for i, m in enumerate(messages) if m["role"] != "system"]
         if not candidates:
             break
-        idx, longest = max(candidates, key=lambda p: len(p[1].get("content", "")))
-        content = longest["content"]
+        # 注意 content 可能为 None（如带 tool_calls 的 assistant 消息），需用 or "" 兜底
+        idx, longest = max(candidates, key=lambda p: len(p[1].get("content") or ""))
+        content = longest.get("content") or ""
         half = len(content) // 2
         messages[idx] = {**longest, "content": content[:half] + "\n…（内容过长已截断）"}
         if verbose:

@@ -135,3 +135,74 @@ class TestMaybeCompress(BaseTestCase):
         messages.append({"role": "user", "content": "很长" * 100000})
         out, _ = maybe_compress(messages, verbose=False)
         self.assertEqual(out[0]["content"], settings.SYSTEM_PROMPT)
+
+    def test_tool_pair_never_split(self):
+        """压缩后最近保留区内的工具调用对（assistant tool_calls + tool 结果）不能被拆散。"""
+        messages = [{"role": "system", "content": settings.SYSTEM_PROMPT}]
+        for i in range(15):
+            messages.append({"role": "user", "content": f"用户问题{i}" + "，" * 1500})
+            messages.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": f"call_{i}",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path": "x.py"}'},
+                }],
+            })
+            messages.append({
+                "role": "tool",
+                "tool_call_id": f"call_{i}",
+                "content": "文件内容" + "，" * 1500,
+            })
+            messages.append({"role": "assistant", "content": f"助手回答{i}" + "，" * 1500})
+
+        self.assertGreater(count_messages_tokens(messages), compress_threshold())
+
+        with patch(
+            "app.services.context.summarize_conversation",
+            return_value="（摘要）",
+        ):
+            out, _ = maybe_compress(messages, verbose=False)
+
+        # recent 区（out[2:]）中：每个带 tool_calls 的 assistant 消息，
+        # 其后必须紧跟相同 tool_call_id 的 tool 消息
+        recent = out[2:]
+        i = 0
+        while i < len(recent):
+            m = recent[i]
+            if m["role"] == "assistant" and m.get("tool_calls"):
+                self.assertLess(i + 1, len(recent), "tool 结果被压缩拆散")
+                self.assertEqual(recent[i + 1]["role"], "tool")
+                self.assertEqual(
+                    recent[i + 1]["tool_call_id"],
+                    m["tool_calls"][0]["id"],
+                    "tool 结果与请求的 tool_call_id 不匹配",
+                )
+                i += 2
+            else:
+                i += 1
+
+    def test_compression_handles_none_content(self):
+        """含 content=None 的 tool_calls 消息在兜底截断时不应抛异常。"""
+        messages = [
+            {"role": "system", "content": settings.SYSTEM_PROMPT},
+            {"role": "user", "content": "a" * 400000},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "x", "arguments": "{}"},
+                }],
+            },
+        ]
+        out, _ = maybe_compress(messages, verbose=False)
+        self.assertLessEqual(
+            count_messages_tokens(out),
+            settings.MAX_CONTEXT_TOKENS - settings.SAFETY_MARGIN,
+        )
+        # 兜底截断不应改动（也不应删除）tool_calls 字段
+        tool_msgs = [m for m in out if m.get("tool_calls")]
+        self.assertEqual(len(tool_msgs), 1)

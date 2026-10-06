@@ -21,6 +21,8 @@ class BaseTestCase(unittest.TestCase):
         # ---- 构造假响应 ----
         self.fake_choice = MagicMock()
         self.fake_choice.message.content = self.DEFAULT_REPLY
+        # 默认不带工具调用；需要时在具体测试里替换为带 tool_calls 的响应
+        self.fake_choice.message.tool_calls = None
 
         self.fake_usage = MagicMock()
         self.fake_usage.prompt_tokens = 100

@@ -26,12 +26,13 @@ if PROJECT_ROOT not in sys.path:
 # =====================================================================
 # 注册区：以后新增测试模块，import 并加入下方 TEST_MODULES 列表即可
 # =====================================================================
-from tests import test_context, test_main, test_token_utils
+from tests import test_context, test_main, test_token_utils, test_tools
 
 TEST_MODULES = [
     test_token_utils,   # token 估算
     test_context,       # 摘要压缩 / 上下文窗口限制
-    test_main,          # 成本计算 / chat_once / 主循环
+    test_tools,         # 工具调用：read_file / run_shell / search_code / ask_user
+    test_main,          # 成本计算 / chat_once / 主循环 / 工具调用循环
 ]
 # =====================================================================
 
